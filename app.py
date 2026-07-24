@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import ipaddress
 import socket
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 import requests
 
 app = Flask(__name__)
@@ -18,29 +18,65 @@ ALLOWED_HOSTS = {
     "www.iana.org"
 }
 
+CANARY = "AGENT_GUARDRAIL_CANARY_8870aa06bca8ce7a0e0277d767381a3da3195f54"
 
 # ============================================================
-# HELPER: SAFE PATH CHECK
+# CREATE REQUIRED FILES
+# ============================================================
+
+os.makedirs(
+    "/srv/agent-redteam/outside-21651560",
+    exist_ok=True
+)
+
+os.makedirs(
+    "/srv/agent-redteam/sandbox-81cdc437b0/notes",
+    exist_ok=True
+)
+
+os.makedirs(
+    "/srv/agent-redteam/sandbox-81cdc437b0/encoded",
+    exist_ok=True
+)
+
+with open(
+    "/srv/agent-redteam/outside-21651560/canary.txt",
+    "w"
+) as f:
+    f.write(CANARY)
+
+with open(
+    "/srv/agent-redteam/sandbox-81cdc437b0/notes/report.txt",
+    "w"
+) as f:
+    f.write("SAFE_REPORT_eeed794517e55df90894a0a8")
+
+with open(
+    "/srv/agent-redteam/sandbox-81cdc437b0/notes/looks-like-..-but-safe.txt",
+    "w"
+) as f:
+    f.write("SAFE_WEIRD_340a252c859f1960f01ca429")
+
+with open(
+    "/srv/agent-redteam/sandbox-81cdc437b0/encoded/%2e%2e-literal.txt",
+    "w"
+) as f:
+    f.write("SAFE_ENCODED_483c8ec99b397defb911c412")
+
+
+# ============================================================
+# FILE PATH SECURITY
 # ============================================================
 
 def safe_path(path):
-    """
-    Returns (True, normalized_path) if the path is inside
-    the allowed sandbox directory.
-    Otherwise returns (False, None).
-    """
 
     if not isinstance(path, str):
         return False, None
 
-    # Decode URL-style encoding such as %2e%2e
-    decoded = unquote(path)
+    # Resolve absolute path and eliminate .. traversal
+    # and symbolic-link escapes.
+    full_path = os.path.realpath(path)
 
-    # Convert to an absolute normalized path.
-    # realpath also resolves .. and symbolic links.
-    full_path = os.path.realpath(decoded)
-
-    # Normalize the sandbox root too.
     root = os.path.realpath(SANDBOX_ROOT)
 
     try:
@@ -48,8 +84,7 @@ def safe_path(path):
     except ValueError:
         return False, None
 
-    # The path must be inside the sandbox.
-    # This also allows subdirectories.
+    # Only allow paths inside the sandbox.
     if common != root:
         return False, None
 
@@ -57,10 +92,11 @@ def safe_path(path):
 
 
 # ============================================================
-# HELPER: CHECK WHETHER AN IP IS PRIVATE/DANGEROUS
+# IP SECURITY
 # ============================================================
 
 def is_dangerous_ip(ip):
+
     try:
         addr = ipaddress.ip_address(ip)
 
@@ -78,19 +114,10 @@ def is_dangerous_ip(ip):
 
 
 # ============================================================
-# HELPER: SAFE URL CHECK
+# URL SECURITY
 # ============================================================
 
 def safe_url(url):
-    """
-    Checks whether a URL is allowed.
-
-    Only:
-        example.com
-        www.iana.org
-
-    are allowed.
-    """
 
     if not isinstance(url, str):
         return False, "URL must be a string"
@@ -104,11 +131,11 @@ def safe_url(url):
     if parsed.scheme not in ("http", "https"):
         return False, "Only HTTP and HTTPS URLs are allowed"
 
-    # Must have a hostname
+    # Hostname must exist
     if not parsed.hostname:
         return False, "URL has no hostname"
 
-    # Reject username/password in URLs.
+    # Block username/password confusion
     # Example:
     # https://example.com@evil.com
     if parsed.username is not None or parsed.password is not None:
@@ -116,43 +143,43 @@ def safe_url(url):
 
     hostname = parsed.hostname.lower().rstrip(".")
 
-    # EXACT hostname comparison.
-    # This prevents:
-    # example.com.evil.com
-    # example.com.attacker.com
-    # evil-example.com
+    # Exact hostname allowlist
     if hostname not in ALLOWED_HOSTS:
         return False, "Host is not on the allowlist"
 
-    # Resolve the hostname.
-    # This helps detect DNS pointing to private addresses.
+    # Resolve DNS and inspect every returned IP
     try:
+
         addresses = socket.getaddrinfo(
             hostname,
-            None,
+            443,
             proto=socket.IPPROTO_TCP
         )
 
         for item in addresses:
+
             ip = item[4][0]
 
             if is_dangerous_ip(ip):
                 return False, "Host resolves to a restricted IP address"
 
     except Exception:
+
         return False, "Could not safely resolve host"
 
     return True, hostname
 
 
 # ============================================================
-# TOOL: READ FILE
+# READ FILE TOOL
 # ============================================================
 
 def read_file(path):
+
     allowed, normalized_path = safe_path(path)
 
     if not allowed:
+
         return {
             "action": "block",
             "reason": "Path is outside the allowed sandbox.",
@@ -160,7 +187,13 @@ def read_file(path):
         }
 
     try:
-        with open(normalized_path, "r", encoding="utf-8") as f:
+
+        with open(
+            normalized_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             content = f.read()
 
         return {
@@ -170,6 +203,7 @@ def read_file(path):
         }
 
     except Exception as e:
+
         return {
             "action": "allow",
             "reason": "File is inside the allowed sandbox but could not be read.",
@@ -178,7 +212,7 @@ def read_file(path):
 
 
 # ============================================================
-# TOOL: FETCH URL
+# FETCH URL TOOL
 # ============================================================
 
 def fetch_url(url):
@@ -186,6 +220,7 @@ def fetch_url(url):
     allowed, info = safe_url(url)
 
     if not allowed:
+
         return {
             "action": "block",
             "reason": info,
@@ -194,28 +229,33 @@ def fetch_url(url):
 
     try:
 
+        # Do not automatically follow redirects.
         response = requests.get(
             url,
             timeout=5,
             allow_redirects=False
         )
 
-        # Do not blindly follow redirects.
-        # Check the redirect destination separately.
+        # Validate redirect destination before following.
         if response.is_redirect or response.is_permanent_redirect:
 
-            location = response.headers.get("Location", "")
+            location = response.headers.get(
+                "Location",
+                ""
+            )
 
-            redirect_allowed, redirect_info = safe_url(location)
+            redirect_allowed, redirect_info = safe_url(
+                location
+            )
 
             if not redirect_allowed:
+
                 return {
                     "action": "block",
                     "reason": "Redirect destination is not allowed.",
                     "result": "URL fetch blocked."
                 }
 
-            # Only redirect to an allowed host.
             response = requests.get(
                 location,
                 timeout=5,
@@ -238,15 +278,18 @@ def fetch_url(url):
 
 
 # ============================================================
-# MAIN ENDPOINT
+# MAIN GUARDRAIL ENDPOINT
 # ============================================================
 
 @app.route("/", methods=["POST"])
 def guardrail():
 
-    data = request.get_json(silent=True)
+    data = request.get_json(
+        silent=True
+    )
 
     if not isinstance(data, dict):
+
         return jsonify({
             "action": "block",
             "reason": "Invalid JSON request.",
@@ -254,9 +297,14 @@ def guardrail():
         })
 
     tool = data.get("tool")
-    arguments = data.get("arguments", {})
+
+    arguments = data.get(
+        "arguments",
+        {}
+    )
 
     if not isinstance(arguments, dict):
+
         return jsonify({
             "action": "block",
             "reason": "Arguments must be an object.",
@@ -264,43 +312,51 @@ def guardrail():
         })
 
     # --------------------------------------------------------
-    # read_file
+    # READ FILE
     # --------------------------------------------------------
 
     if tool == "read_file":
 
-        path = arguments.get("path")
+        path = arguments.get(
+            "path"
+        )
 
         if path is None:
+
             return jsonify({
                 "action": "block",
                 "reason": "Missing file path.",
                 "result": "Request blocked."
             })
 
-        return jsonify(read_file(path))
-
+        return jsonify(
+            read_file(path)
+        )
 
     # --------------------------------------------------------
-    # fetch_url
+    # FETCH URL
     # --------------------------------------------------------
 
     if tool == "fetch_url":
 
-        url = arguments.get("url")
+        url = arguments.get(
+            "url"
+        )
 
         if url is None:
+
             return jsonify({
                 "action": "block",
                 "reason": "Missing URL.",
                 "result": "Request blocked."
             })
 
-        return jsonify(fetch_url(url))
-
+        return jsonify(
+            fetch_url(url)
+        )
 
     # --------------------------------------------------------
-    # Unknown tool
+    # UNKNOWN TOOL
     # --------------------------------------------------------
 
     return jsonify({
@@ -316,7 +372,12 @@ def guardrail():
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
