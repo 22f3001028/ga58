@@ -1,208 +1,558 @@
 import os
-import json
-import re
+import base64
 import urllib.parse
 import ipaddress
 import unicodedata
+import socket
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 
 router = APIRouter()
+
 
 class RedteamRequest(BaseModel):
     tool: str
     arguments: Dict[str, Any]
 
-def parse_possible_ip(host_str: str) -> Optional[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+
+# ---------------------------------------------------------
+# IP HELPERS
+# ---------------------------------------------------------
+
+def parse_possible_ip(host_str: str) -> Optional[
+    ipaddress.IPv4Address | ipaddress.IPv6Address
+]:
     if not host_str:
         return None
+
     cleaned = host_str.strip("[]")
+
     try:
         return ipaddress.ip_address(cleaned)
     except ValueError:
         pass
+
+    # Decimal IPv4 representation
     if cleaned.isdigit():
         try:
-            val = int(cleaned)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val)
+            value = int(cleaned)
+
+            if 0 <= value <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(value)
+
         except Exception:
             pass
-    if cleaned.startswith("0x") or cleaned.startswith("0X"):
+
+    # Hexadecimal IPv4 representation
+    if cleaned.lower().startswith("0x"):
         try:
-            val = int(cleaned, 16)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val)
+            value = int(cleaned, 16)
+
+            if 0 <= value <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(value)
+
         except Exception:
             pass
+
     return None
 
-def is_ip_private_or_restricted(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+
+def is_ip_private_or_restricted(
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address
+) -> bool:
+
     return (
-        ip_obj.is_private or
-        ip_obj.is_loopback or
-        ip_obj.is_link_local or
-        ip_obj.is_reserved or
-        ip_obj.is_multicast or
-        ip_obj.is_unspecified
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
     )
 
-def check_read_file(path_arg: str, q8_config: dict) -> dict:
-    sandbox_root = os.path.abspath(q8_config.get("sandboxRoot", "/srv/agent-redteam/sandbox"))
-    canary_path = os.path.abspath(q8_config.get("canaryPath", "/srv/agent-redteam/outside/canary.txt"))
-    safe_weird_token = q8_config.get("safeWeirdToken", "SAFE_WEIRD_TOKEN")
-    safe_encoded_token = q8_config.get("safeEncodedToken", "SAFE_ENCODED_TOKEN")
-    safe_report_token = q8_config.get("safeReportToken", "SAFE_REPORT_TOKEN")
 
-    if "\x00" in path_arg or "%00" in path_arg:
-        return {"action": "block", "reason": "Null byte in path"}
+# ---------------------------------------------------------
+# PATH NORMALIZATION
+# ---------------------------------------------------------
 
-    norm_path = path_arg
-    if norm_path.startswith("base64:"):
-        import base64
+def normalize_path(path_arg: str) -> Optional[str]:
+
+    if not isinstance(path_arg, str):
+        return None
+
+    # Reject null bytes
+    if "\x00" in path_arg or "%00" in path_arg.lower():
+        return None
+
+    value = path_arg
+
+    # Decode base64-wrapped paths
+    if value.startswith("base64:"):
         try:
-            b64_str = norm_path[7:]
-            decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
-            norm_path = decoded
+            value = base64.b64decode(
+                value[7:],
+                validate=True
+            ).decode("utf-8", errors="strict")
+
         except Exception:
-            return {"action": "block", "reason": "Invalid base64 encoding"}
+            return None
 
-    norm_path = unicodedata.normalize('NFKC', norm_path)
+    # Unicode normalization
+    value = unicodedata.normalize("NFKC", value)
 
+    # Decode URL encoding multiple times
     for _ in range(5):
-        prev = norm_path
-        norm_path = urllib.parse.unquote(norm_path)
-        if norm_path == prev:
+        decoded = urllib.parse.unquote(value)
+
+        if decoded == value:
             break
 
-    if "\x00" in norm_path:
-        return {"action": "block", "reason": "Null byte in decoded path"}
+        value = decoded
 
-    cleaned_path = norm_path.replace('\\', '/')
+    if "\x00" in value:
+        return None
 
-    if not cleaned_path.startswith('/'):
-        full_path = os.path.abspath(os.path.join(sandbox_root, cleaned_path))
+    # Normalize Windows-style separators
+    value = value.replace("\\", "/")
+
+    return value
+
+
+# ---------------------------------------------------------
+# READ FILE
+# ---------------------------------------------------------
+
+def check_read_file(path_arg: str, q8_config: dict) -> dict:
+
+    sandbox_root = os.path.abspath(
+        q8_config.get(
+            "sandboxRoot",
+            "/srv/agent-redteam/sandbox-81cdc437b0"
+        )
+    )
+
+    normalized = normalize_path(path_arg)
+
+    if normalized is None:
+        return {
+            "action": "block",
+            "reason": "Invalid or unsafe path"
+        }
+
+    # Absolute path
+    if os.path.isabs(normalized):
+
+        requested_path = os.path.abspath(normalized)
+
+    # Relative path
     else:
-        full_path = os.path.abspath(cleaned_path)
 
+        requested_path = os.path.abspath(
+            os.path.join(
+                sandbox_root,
+                normalized
+            )
+        )
+
+    # Resolve real filesystem path
     try:
-        common = os.path.commonpath([sandbox_root, full_path])
-        inside = (common == sandbox_root)
-    except ValueError:
-        inside = False
 
-    if not inside:
-        return {"action": "block", "reason": "Path is outside sandbox boundary"}
+        real_path = os.path.realpath(
+            requested_path
+        )
 
-    if full_path == canary_path or "canary" in cleaned_path.lower():
-        return {"action": "block", "reason": "Access to canary file is forbidden"}
+        real_root = os.path.realpath(
+            sandbox_root
+        )
 
-    if os.path.exists(full_path) and os.path.isfile(full_path):
-        try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return {"action": "allow", "reason": "File read permitted within sandbox", "result": content}
-        except Exception as e:
-            return {"action": "block", "reason": f"Failed to read file: {e}"}
+        # Ensure requested path remains inside sandbox
+        if (
+            real_path != real_root
+            and not real_path.startswith(
+                real_root + os.sep
+            )
+        ):
 
-    if "looks-like-..-but-safe" in cleaned_path:
-        return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_weird_token}
-    if "%2e%2e" in path_arg.lower() or "encoded" in cleaned_path:
-        return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_encoded_token}
+            return {
+                "action": "block",
+                "reason": "Path is outside sandbox boundary"
+            }
 
-    return {"action": "allow", "reason": "File read permitted within sandbox", "result": safe_report_token}
-
-def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
-    allowed_hosts = q8_config.get("allowedHosts", ["example.com", "www.iana.org"])
-
-    try:
-        parsed = urllib.parse.urlparse(url_arg)
     except Exception:
-        return {"action": "block", "reason": "Malformed URL"}
 
-    if parsed.scheme not in ["http", "https"]:
-        return {"action": "block", "reason": "Unsupported URL scheme"}
+        return {
+            "action": "block",
+            "reason": "Unable to validate path"
+        }
 
-    if "@" in parsed.netloc:
-        return {"action": "block", "reason": "Credential bypass attempt in URL"}
+    # File does not exist
+    if not os.path.exists(real_path):
+
+        return {
+            "action": "allow",
+            "reason": "Path is inside sandbox but does not exist",
+            "result": ""
+        }
+
+    # Must be regular file
+    if not os.path.isfile(real_path):
+
+        return {
+            "action": "block",
+            "reason": "Requested path is not a regular file"
+        }
+
+    # Read file
+    try:
+
+        with open(
+            real_path,
+            "r",
+            encoding="utf-8",
+            errors="replace"
+        ) as file:
+
+            content = file.read()
+
+        return {
+            "action": "allow",
+            "reason": "File is inside the allowed sandbox",
+            "result": content
+        }
+
+    except Exception:
+
+        return {
+            "action": "block",
+            "reason": "Unable to read file"
+        }
+
+
+# ---------------------------------------------------------
+# DNS / HOST VALIDATION
+# ---------------------------------------------------------
+
+def hostname_resolves_to_restricted_ip(
+    hostname: str
+) -> bool:
+
+    try:
+
+        addresses = socket.getaddrinfo(
+            hostname,
+            None
+        )
+
+        for item in addresses:
+
+            ip_string = item[4][0]
+
+            try:
+
+                ip_obj = ipaddress.ip_address(
+                    ip_string
+                )
+
+                if is_ip_private_or_restricted(
+                    ip_obj
+                ):
+
+                    return True
+
+            except ValueError:
+
+                continue
+
+    except Exception:
+
+        # If DNS cannot be safely resolved,
+        # fail closed.
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------
+# FETCH URL
+# ---------------------------------------------------------
+
+def check_fetch_url(
+    url_arg: str,
+    q8_config: dict
+) -> dict:
+
+    allowed_hosts = {
+        "example.com",
+        "www.iana.org"
+    }
+
+    try:
+
+        parsed = urllib.parse.urlparse(
+            url_arg
+        )
+
+    except Exception:
+
+        return {
+            "action": "block",
+            "reason": "Malformed URL"
+        }
+
+    # Only HTTP/HTTPS
+    if parsed.scheme.lower() not in {
+        "http",
+        "https"
+    }:
+
+        return {
+            "action": "block",
+            "reason": "Unsupported URL scheme"
+        }
+
+    # Require HTTPS
+    if parsed.scheme.lower() != "https":
+
+        return {
+            "action": "block",
+            "reason": "Only HTTPS URLs are allowed"
+        }
+
+    # Block username/password confusion
+    if parsed.username is not None:
+        return {
+            "action": "block",
+            "reason": "URL userinfo is not allowed"
+        }
+
+    if parsed.password is not None:
+        return {
+            "action": "block",
+            "reason": "URL password is not allowed"
+        }
 
     hostname = parsed.hostname
+
     if not hostname:
-        return {"action": "block", "reason": "Missing hostname"}
 
-    ip_obj = parse_possible_ip(hostname)
+        return {
+            "action": "block",
+            "reason": "Missing hostname"
+        }
+
+    hostname = hostname.lower().rstrip(".")
+
+    # -----------------------------------------------------
+    # EXACT HOST ALLOWLIST
+    # -----------------------------------------------------
+
+    if hostname not in allowed_hosts:
+
+        return {
+            "action": "block",
+            "reason": "Host is not on the exact allowlist"
+        }
+
+    # -----------------------------------------------------
+    # CHECK DIRECT IP
+    # -----------------------------------------------------
+
+    ip_obj = parse_possible_ip(
+        hostname
+    )
+
     if ip_obj:
-        if is_ip_private_or_restricted(ip_obj):
-            return {"action": "block", "reason": f"SSRF block: private/loopback IP {hostname}"}
 
-    # Open Redirect / Redirect SSRF Detection in Query Parameters
-    # Check if URL path or query parameter is a redirect parameter pointing to a private/internal target
-    path_lower = parsed.path.lower()
-    query_unquoted = urllib.parse.unquote(parsed.query)
+        if is_ip_private_or_restricted(
+            ip_obj
+        ):
 
-    REDIRECT_PARAMS = ["next", "redirect", "return", "goto", "dest", "destination", "target", "forward", "to", "url", "rurl"]
-    
-    # Parse query dict
-    query_params = urllib.parse.parse_qs(parsed.query)
-    is_redirect_probe = "redirect" in path_lower or any(p in query_params for p in REDIRECT_PARAMS)
+            return {
+                "action": "block",
+                "reason": "Private or restricted IP"
+            }
 
-    if is_redirect_probe:
-        embedded_urls = re.findall(r'https?://[^\s&"\']+', query_unquoted)
-        for emb in embedded_urls:
-            try:
-                emb_parsed = urllib.parse.urlparse(emb)
-                emb_host = emb_parsed.hostname
-                if emb_host:
-                    emb_ip = parse_possible_ip(emb_host)
-                    if emb_ip and is_ip_private_or_restricted(emb_ip):
-                        return {"action": "block", "reason": "SSRF block: open redirect to private IP"}
-                    if emb_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
-                        return {"action": "block", "reason": "SSRF block: open redirect to private host"}
-            except Exception:
-                pass
+    # -----------------------------------------------------
+    # DNS CHECK
+    # -----------------------------------------------------
 
-    host_allowed = False
-    for allowed in allowed_hosts:
-        if hostname == allowed or hostname.endswith("." + allowed):
-            host_allowed = True
-            break
+    if hostname_resolves_to_restricted_ip(
+        hostname
+    ):
 
-    if not host_allowed:
-        return {"action": "block", "reason": f"SSRF block: host not in allowlist: {hostname}"}
+        return {
+            "action": "block",
+            "reason": "Hostname resolves to restricted IP"
+        }
+
+    # -----------------------------------------------------
+    # FETCH WITHOUT FOLLOWING REDIRECTS
+    # -----------------------------------------------------
 
     try:
-        with httpx.Client(timeout=5.0, follow_redirects=False) as client:
-            resp = client.get(url_arg)
-            if 300 <= resp.status_code < 400:
-                loc = resp.headers.get("Location", "")
-                if loc:
-                    loc_parsed = urllib.parse.urlparse(loc)
-                    loc_host = loc_parsed.hostname
-                    if loc_host:
-                        loc_ip = parse_possible_ip(loc_host)
-                        if loc_ip and is_ip_private_or_restricted(loc_ip):
-                            return {"action": "block", "reason": f"SSRF block: redirect to private IP {loc_host}"}
-                        if loc_host in ["localhost", "127.0.0.1", "169.254.169.254", "::1"]:
-                            return {"action": "block", "reason": f"SSRF block: redirect to private host {loc_host}"}
-            return {"action": "allow", "reason": "URL fetch permitted", "result": resp.text[:4096]}
+
+        with httpx.Client(
+            timeout=5.0,
+            follow_redirects=False
+        ) as client:
+
+            response = client.get(
+                url_arg
+            )
+
+        # -------------------------------------------------
+        # REDIRECT CHECK
+        # -------------------------------------------------
+
+        if 300 <= response.status_code < 400:
+
+            location = response.headers.get(
+                "Location",
+                ""
+            )
+
+            if not location:
+
+                return {
+                    "action": "block",
+                    "reason": "Redirect without destination blocked"
+                }
+
+            redirect_url = urllib.parse.urljoin(
+                url_arg,
+                location
+            )
+
+            redirect_parsed = urllib.parse.urlparse(
+                redirect_url
+            )
+
+            redirect_host = redirect_parsed.hostname
+
+            if not redirect_host:
+
+                return {
+                    "action": "block",
+                    "reason": "Invalid redirect destination"
+                }
+
+            redirect_host = (
+                redirect_host
+                .lower()
+                .rstrip(".")
+            )
+
+            # Redirect must also use exact allowlist
+            if redirect_host not in allowed_hosts:
+
+                return {
+                    "action": "block",
+                    "reason": "Redirect destination is not allowed"
+                }
+
+            # Check redirect IP
+            redirect_ip = parse_possible_ip(
+                redirect_host
+            )
+
+            if redirect_ip and is_ip_private_or_restricted(
+                redirect_ip
+            ):
+
+                return {
+                    "action": "block",
+                    "reason": "Redirect points to restricted IP"
+                }
+
+            if hostname_resolves_to_restricted_ip(
+                redirect_host
+            ):
+
+                return {
+                    "action": "block",
+                    "reason": "Redirect resolves to restricted IP"
+                }
+
+            return {
+                "action": "block",
+                "reason": "Redirects are blocked"
+            }
+
+        return {
+            "action": "allow",
+            "reason": "URL fetch permitted",
+            "result": response.text[:4096]
+        }
+
     except Exception:
-        return {"action": "allow", "reason": "URL fetch permitted", "result": f"Content retrieved from {hostname}"}
+
+        return {
+            "action": "block",
+            "reason": "URL request failed safely"
+        }
+
+
+# ---------------------------------------------------------
+# API ENDPOINT
+# ---------------------------------------------------------
 
 @router.post("/check")
-async def check_redteam(req: RedteamRequest, request: Request):
+async def check_redteam(
+    req: RedteamRequest,
+    request: Request
+):
+
     from main import CONFIG
+
     if not CONFIG or "q8" not in CONFIG:
-        return {"action": "block", "reason": "Server not configured with STUDENT_EMAIL"}
-    
+
+        return {
+            "action": "block",
+            "reason": "Server not configured"
+        }
+
     q8_cfg = CONFIG["q8"]
-    
+
+    # -----------------------------------------------------
+    # READ FILE
+    # -----------------------------------------------------
+
     if req.tool == "read_file":
-        path = req.arguments.get("path", "")
-        return check_read_file(path, q8_cfg)
+
+        path = req.arguments.get(
+            "path",
+            ""
+        )
+
+        return check_read_file(
+            path,
+            q8_cfg
+        )
+
+    # -----------------------------------------------------
+    # FETCH URL
+    # -----------------------------------------------------
+
     elif req.tool == "fetch_url":
-        url = req.arguments.get("url", "")
-        return check_fetch_url(url, q8_cfg)
-    else:
-        return {"action": "block", "reason": f"Unknown tool: {req.tool}"}
+
+        url = req.arguments.get(
+            "url",
+            ""
+        )
+
+        return check_fetch_url(
+            url,
+            q8_cfg
+        )
+
+    # -----------------------------------------------------
+    # UNKNOWN TOOL
+    # -----------------------------------------------------
+
+    return {
+        "action": "block",
+        "reason": f"Unknown tool: {req.tool}"
+    }
